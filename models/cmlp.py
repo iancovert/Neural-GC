@@ -61,6 +61,9 @@ class cMLP(nn.Module):
         Args:
           X: torch tensor of shape (batch, T, p).
           i: index of the time series to forecast.
+
+        Returns:
+          predictions from one MLP or all MLPs.
         '''
         if i is None:
             return torch.cat([network(X) for network in self.networks], dim=2)
@@ -70,9 +73,15 @@ class cMLP(nn.Module):
     def GC(self, threshold=True, ignore_lag=True):
         '''Extract learned Granger causality.
 
+        Args:
+          threshold: return norm of weights, or whether norm is nonzero.
+          ignore_lag: if true, calculate norm of weights jointly for all lags.
+
         Returns:
-          GC: (p x p) binary matrix. Entry at (i, j) indicates whether variable
-            j is Granger causal of variable i.
+          GC: (p x p) or (p x p x lag) matrix. In first case, entry (i, j)
+            indicates whether variable j is Granger causal of variable i. In
+            second case, entry (i, j, k) indicates whether it's Granger causal
+            at lag k.
         '''
         if ignore_lag:
             GC = [torch.norm(net.layers[0].weight, dim=(0, 2))
@@ -123,6 +132,9 @@ class cMLPSparse(nn.Module):
         Args:
           X: torch tensor of shape (batch, T, p).
           i: index of the time series to forecast.
+
+        Returns:
+          predictions from one MLP or all MLPs.
         '''
         if i is None:
             return torch.cat([self.networks[i](X[:, :, self.sparsity[i]])
@@ -221,9 +233,6 @@ def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
     cmlp_copy = deepcopy(cmlp)
     loss_fn = nn.MSELoss(reduction='mean')
 
-    train_loss_list = []
-    train_mse_list = []
-
     # Calculate full loss.
     mse_list = []
     smooth_list = []
@@ -239,6 +248,13 @@ def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
             nonsmooth = regularize(net, lam, penalty)
             loss = smooth + nonsmooth
             loss_list.append(loss)
+
+    # Set up lists for loss and mse.
+    with torch.no_grad():
+        loss_mean = sum(loss_list) / p
+        mse_mean = sum(mse_list) / p
+    train_loss_list = [loss_mean]
+    train_mse_list = [mse_mean]
 
     # For switching to line search.
     line_search = False
@@ -296,7 +312,7 @@ def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
                          zip(net.parameters(), net_copy.parameters())])
 
                 comp = loss_list[i] if monotone else max(last_losses[i])
-                if (comp - loss) > tol:
+                if not line_search or (comp - loss) > tol:
                     step = True
                     if verbose > 1:
                         print('Taking step, network i = %d, lr = %f'
@@ -362,7 +378,7 @@ def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
                       % (100 * torch.mean(cmlp.GC().float())))
 
             # Check whether loss has increased.
-            if not line_search and len(train_loss_list) > 1:
+            if not line_search:
                 if train_loss_list[-2] - train_loss_list[-1] < switch_tol:
                     line_search = True
                     if verbose > 0:
