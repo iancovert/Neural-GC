@@ -172,11 +172,13 @@ def arrange_input(data, context):
     assert context >= 1 and isinstance(context, int)
     input = torch.zeros(len(data) - context, context, data.shape[1],
                         dtype=torch.float32, device=data.device)
+    target = torch.zeros(len(data) - context, context, data.shape[1],
+                         dtype=torch.float32, device=data.device)
     for i in range(context):
         start = i
         end = len(data) - context + i
         input[:, i, :] = data[start:end]
-    target = data[context:].float()
+        target[:, i, :] = data[start+1:end+1]
     return input.detach(), target.detach()
 
 
@@ -223,7 +225,7 @@ def train_model_gista(clstm, X, context, lam, lam_ridge, lr, max_iter,
     for i in range(p):
         net = clstm.networks[i]
         pred, _ = net(X)
-        mse = loss_fn(pred[:, -1, 0], Y[:, i])
+        mse = loss_fn(pred[:, :, 0], Y[:, :, i])
         ridge = ridge_regularize(net, lam_ridge)
         smooth = mse + ridge
         mse_list.append(mse)
@@ -285,7 +287,7 @@ def train_model_gista(clstm, X, context, lam, lam_ridge, lr, max_iter,
 
                 # Check line search criterion.
                 pred, _ = net_copy(X)
-                mse = loss_fn(pred[:, -1, 0], Y[:, i])
+                mse = loss_fn(pred[:, :, 0], Y[:, :, i])
                 ridge = ridge_regularize(net_copy, lam_ridge)
                 smooth = mse + ridge
                 with torch.no_grad():
@@ -397,7 +399,7 @@ def train_model_adam(clstm, X, context, lr, max_iter, lam=0, lam_ridge=0,
     for it in range(max_iter):
         # Calculate loss.
         pred = [clstm.networks[i](X)[0] for i in range(p)]
-        loss = sum([loss_fn(pred[i][:, -1, 0], Y[:, i]) for i in range(p)])
+        loss = sum([loss_fn(pred[i][:, :, 0], Y[:, :, i]) for i in range(p)])
 
         # Add penalty term.
         if lam > 0:
@@ -456,7 +458,7 @@ def train_model_ista(clstm, X, context, lr, max_iter, lam=0, lam_ridge=0,
 
     # Calculate smooth error.
     pred = [clstm.networks[i](X)[0] for i in range(p)]
-    loss = sum([loss_fn(pred[i][:, -1, 0], Y[:, i]) for i in range(p)])
+    loss = sum([loss_fn(pred[i][:, :, 0], Y[:, :, i]) for i in range(p)])
     ridge = sum([ridge_regularize(net, lam_ridge) for net in clstm.networks])
     smooth = loss + ridge
 
@@ -475,7 +477,7 @@ def train_model_ista(clstm, X, context, lr, max_iter, lam=0, lam_ridge=0,
 
         # Calculate loss for next iteration.
         pred = [clstm.networks[i](X)[0] for i in range(p)]
-        loss = sum([loss_fn(pred[i][:, -1, 0], Y[:, i]) for i in range(p)])
+        loss = sum([loss_fn(pred[i][:, :, 0], Y[:, :, i]) for i in range(p)])
         ridge = sum([ridge_regularize(net, lam_ridge)
                      for net in clstm.networks])
         smooth = loss + ridge
@@ -530,7 +532,7 @@ def train_unregularized(clstm, X, context, lr, max_iter, lookback=5,
     for it in range(max_iter):
         # Calculate loss.
         pred, hidden = clstm(X)
-        loss = sum([loss_fn(pred[:, -1, i], Y[:, i]) for i in range(p)])
+        loss = sum([loss_fn(pred[:, :, i], Y[:, :, i]) for i in range(p)])
 
         # Take gradient step.
         loss.backward()
