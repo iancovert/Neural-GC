@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 from copy import deepcopy
 from models.model_helper import activation_helper
 
@@ -32,7 +33,8 @@ class MLP(nn.Module):
 
 class cMLP(nn.Module):
     def __init__(self, num_series, lag, hidden, activation='relu'):
-        '''cMLP model.
+        '''
+        cMLP model with one MLP per time series.
 
         Args:
           num_series: dimensionality of multivariate time series.
@@ -46,32 +48,22 @@ class cMLP(nn.Module):
         self.activation = activation_helper(activation)
 
         # Set up networks.
-        self.networks = [MLP(num_series, lag, hidden, activation)
-                         for _ in range(num_series)]
+        self.networks = nn.ModuleList([
+            MLP(num_series, lag, hidden, activation)
+            for _ in range(num_series)])
 
-        # Register parameters.
-        param_list = []
-        for i in range(num_series):
-            param_list += list(self.networks[i].parameters())
-        self.param_list = nn.ParameterList(param_list)
-
-    def forward(self, X, i=None):
-        '''Perform forward pass.
+    def forward(self, X):
+        '''
+        Perform forward pass.
 
         Args:
           X: torch tensor of shape (batch, T, p).
-          i: index of the time series to forecast.
-
-        Returns:
-          predictions from one MLP or all MLPs.
         '''
-        if i is None:
-            return torch.cat([network(X) for network in self.networks], dim=2)
-        else:
-            return self.networks[i](X)[:, :, 0]
+        return torch.cat([network(X) for network in self.networks], dim=2)
 
     def GC(self, threshold=True, ignore_lag=True):
-        '''Extract learned Granger causality.
+        '''
+        Extract learned Granger causality.
 
         Args:
           threshold: return norm of weights, or whether norm is nonzero.
@@ -98,7 +90,8 @@ class cMLP(nn.Module):
 
 class cMLPSparse(nn.Module):
     def __init__(self, num_series, sparsity, lag, hidden, activation='relu'):
-        '''cMLP model that only uses specified interactions.
+        '''
+        cMLP model that only uses specified interactions.
 
         Args:
           num_series: dimensionality of multivariate time series.
@@ -126,26 +119,20 @@ class cMLPSparse(nn.Module):
             param_list += list(self.networks[i].parameters())
         self.param_list = nn.ParameterList(param_list)
 
-    def forward(self, X, i=None):
-        '''Perform forward pass.
+    def forward(self, X):
+        '''
+        Perform forward pass.
 
         Args:
           X: torch tensor of shape (batch, T, p).
-          i: index of the time series to forecast.
-
-        Returns:
-          predictions from one MLP or all MLPs.
         '''
-        if i is None:
-            return torch.cat([self.networks[i](X[:, :, self.sparsity[i]])
-                              for i in range(self.p)], dim=2)
-        else:
-            X_subset = X[:, :, self.sparsity[i]]
-            return self.networks[i](X_subset)[:, :, 0]
+        return torch.cat([self.networks[i](X[:, :, self.sparsity[i]])
+                          for i in range(self.p)], dim=2)
 
 
 def prox_update(network, lam, lr, penalty):
-    '''Perform in place proximal update on first layer weight matrix.
+    '''
+    Perform in place proximal update on first layer weight matrix.
 
     Args:
       network: MLP network.
@@ -158,28 +145,29 @@ def prox_update(network, lam, lr, penalty):
     hidden, p, lag = W.shape
     if penalty == 'GL':
         norm = torch.norm(W, dim=(0, 2), keepdim=True)
-        W.data = ((W / torch.clamp(norm, min=(lr * lam * 0.1)))
+        W.data = ((W / torch.clamp(norm, min=(lr * lam)))
                   * torch.clamp(norm - (lr * lam), min=0.0))
     elif penalty == 'GSGL':
         norm = torch.norm(W, dim=0, keepdim=True)
-        W.data = ((W / torch.clamp(norm, min=(lr * lam * 0.1)))
+        W.data = ((W / torch.clamp(norm, min=(lr * lam)))
                   * torch.clamp(norm - (lr * lam), min=0.0))
         norm = torch.norm(W, dim=(0, 2), keepdim=True)
-        W.data = ((W / torch.clamp(norm, min=(lr * lam * 0.1)))
+        W.data = ((W / torch.clamp(norm, min=(lr * lam)))
                   * torch.clamp(norm - (lr * lam), min=0.0))
     elif penalty == 'H':
         # Lowest indices along third axis touch most lagged values.
         for i in range(lag):
             norm = torch.norm(W[:, :, :(i + 1)], dim=(0, 2), keepdim=True)
             W.data[:, :, :(i+1)] = (
-                (W.data[:, :, :(i+1)] / torch.clamp(norm, min=(lr * lam * 0.1)))
+                (W.data[:, :, :(i+1)] / torch.clamp(norm, min=(lr * lam)))
                 * torch.clamp(norm - (lr * lam), min=0.0))
     else:
         raise ValueError('unsupported penalty: %s' % penalty)
 
 
 def regularize(network, lam, penalty):
-    '''Calculate regularization term for first layer weight matrix.
+    '''
+    Calculate regularization term for first layer weight matrix.
 
     Args:
       network: MLP network.
@@ -206,10 +194,18 @@ def ridge_regularize(network, lam):
     return lam * sum([torch.sum(fc.weight ** 2) for fc in network.layers[1:]])
 
 
+def restore_parameters(model, best_model):
+    '''Move parameter values from best_model to model.'''
+    for params, best_params in zip(model.parameters(), best_model.parameters()):
+        params.data = best_params
+
+
 def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
-                      check_every=1000, r=0.8, lr_min=1e-12, sigma=0.5,
-                      monotone=False, m=10, switch_tol=1e-3, verbose=1):
-    '''Train cMLP model with GISTA.
+                      check_every=100, r=0.8, lr_min=1e-8, sigma=0.5,
+                      monotone=False, m=10, lr_decay=0.5,
+                      begin_line_search=True, switch_tol=1e-3, verbose=1):
+    '''
+    Train cMLP model with GISTA.
 
     Args:
       clstm: clstm model.
@@ -225,6 +221,8 @@ def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
       sigma: for line search.
       monotone: for line search.
       m: for line search.
+      lr_decay: for adjusting initial learning rate of line search.
+      begin_line_search: whether to begin with line search.
       switch_tol: tolerance for switching to line search.
       verbose: level of verbosity (0, 1, 2).
     '''
@@ -232,6 +230,7 @@ def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
     lag = cmlp.lag
     cmlp_copy = deepcopy(cmlp)
     loss_fn = nn.MSELoss(reduction='mean')
+    lr_list = [lr for _ in range(p)]
 
     # Calculate full loss.
     mse_list = []
@@ -257,7 +256,7 @@ def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
     train_mse_list = [mse_mean]
 
     # For switching to line search.
-    line_search = False
+    line_search = begin_line_search
 
     # For line search criterion.
     done = [False for _ in range(p)]
@@ -286,7 +285,7 @@ def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
 
             # Prepare for line search.
             step = False
-            lr_it = lr
+            lr_it = lr_list[i]
             net = cmlp.networks[i]
             net_copy = cmlp_copy.networks[i]
 
@@ -323,6 +322,10 @@ def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
                     new_mse_list.append(mse)
                     new_smooth_list.append(smooth)
                     new_loss_list.append(loss)
+
+                    # Adjust initial learning rate.
+                    lr_list[i] = (
+                        (lr_list[i] ** (1 - lr_decay)) * (lr_it ** lr_decay))
 
                     if not monotone:
                         if len(last_losses[i]) == m:
@@ -387,27 +390,175 @@ def train_model_gista(cmlp, X, lam, lam_ridge, lr, penalty, max_iter,
     return train_loss_list, train_mse_list
 
 
-def train_model_adam(cmlp, X, lr, niter, check_every, verbose=0):
+def train_model_adam(cmlp, X, lr, max_iter, lam=0, lam_ridge=0, penalty='H',
+                     lookback=5, check_every=100, verbose=1):
     '''Train model with Adam.'''
     lag = cmlp.lag
+    p = X.shape[-1]
     loss_fn = nn.MSELoss(reduction='mean')
     optimizer = torch.optim.Adam(cmlp.parameters(), lr=lr)
     train_loss_list = []
 
-    for it in range(niter):
-        # Calculate gradients.
-        loss = loss_fn(cmlp(X[:, :-1]), X[:, lag:])
-        loss.backward()
+    # For early stopping.
+    best_it = None
+    best_loss = np.inf
+    best_model = None
 
+    for it in range(max_iter):
+        # Calculate loss.
+        loss = sum([loss_fn(cmlp.networks[i](X[:, :-1]), X[:, lag:, i:i+1])
+                    for i in range(p)])
+
+        # Add penalty terms.
+        if lam > 0:
+            loss = loss + sum([regularize(net, lam, penalty)
+                               for net in cmlp.networks])
+        if lam_ridge > 0:
+            loss = loss + sum([ridge_regularize(net, lam_ridge)
+                               for net in cmlp.networks])
+
+        # Take gradient step.
+        loss.backward()
         optimizer.step()
         cmlp.zero_grad()
 
         # Check progress.
         if (it + 1) % check_every == 0:
-            train_loss_list.append(loss.detach())
+            mean_loss = loss / p
+            train_loss_list.append(mean_loss.detach())
 
             if verbose > 0:
                 print(('-' * 10 + 'Iter = %d' + '-' * 10) % (it + 1))
-                print('Loss = %f' % loss)
+                print('Loss = %f' % mean_loss)
+
+            # Check for early stopping.
+            if mean_loss < best_loss:
+                best_loss = mean_loss
+                best_it = it
+                best_model = deepcopy(cmlp)
+            elif (it - best_it) == lookback * check_every:
+                if verbose:
+                    print('Stopping early')
+                break
+
+    # Restore best model.
+    restore_parameters(cmlp, best_model)
+
+    return train_loss_list
+
+
+def train_model_ista(cmlp, X, lr, max_iter, lam=0, lam_ridge=0, penalty='H',
+                     lookback=5, check_every=100, verbose=1):
+    '''Train model with Adam.'''
+    lag = cmlp.lag
+    p = X.shape[-1]
+    loss_fn = nn.MSELoss(reduction='mean')
+    train_loss_list = []
+
+    # For early stopping.
+    best_it = None
+    best_loss = np.inf
+    best_model = None
+
+    # Calculate smooth error.
+    loss = sum([loss_fn(cmlp.networks[i](X[:, :-1]), X[:, lag:, i:i+1])
+                for i in range(p)])
+    ridge = sum([ridge_regularize(net, lam_ridge) for net in cmlp.networks])
+    smooth = loss + ridge
+
+    for it in range(max_iter):
+        # Take gradient step.
+        smooth.backward()
+        for param in cmlp.parameters():
+            param.data = param - lr * param.grad
+
+        # Take prox step.
+        if lam > 0:
+            for net in cmlp.networks:
+                prox_update(net, lam, lr, penalty)
+
+        cmlp.zero_grad()
+
+        # Calculate loss for next iteration.
+        loss = sum([loss_fn(cmlp.networks[i](X[:, :-1]), X[:, lag:, i:i+1])
+                    for i in range(p)])
+        ridge = sum([ridge_regularize(net, lam_ridge) for net in cmlp.networks])
+        smooth = loss + ridge
+
+        # Check progress.
+        if (it + 1) % check_every == 0:
+            # Add nonsmooth penalty.
+            nonsmooth = sum([regularize(net, lam, penalty)
+                             for net in cmlp.networks])
+            mean_loss = (smooth + nonsmooth) / p
+            train_loss_list.append(mean_loss.detach())
+
+            if verbose > 0:
+                print(('-' * 10 + 'Iter = %d' + '-' * 10) % (it + 1))
+                print('Loss = %f' % mean_loss)
+                print('Variable usage = %.2f%%'
+                      % (100 * torch.mean(cmlp.GC().float())))
+
+            # Check for early stopping.
+            if mean_loss < best_loss:
+                best_loss = mean_loss
+                best_it = it
+                best_model = deepcopy(cmlp)
+            elif (it - best_it) == lookback * check_every:
+                if verbose:
+                    print('Stopping early')
+                break
+
+    # Restore best model.
+    restore_parameters(cmlp, best_model)
+
+    return train_loss_list
+
+
+def train_unregularized(cmlp, X, lr, max_iter, lookback=5, check_every=100,
+                        verbose=1):
+    '''Train model with Adam and no regularization.'''
+    lag = cmlp.lag
+    p = X.shape[-1]
+    loss_fn = nn.MSELoss(reduction='mean')
+    optimizer = torch.optim.Adam(cmlp.parameters(), lr=lr)
+    train_loss_list = []
+
+    # For early stopping.
+    best_it = None
+    best_loss = np.inf
+    best_model = None
+
+    for it in range(max_iter):
+        # Calculate loss.
+        pred = cmlp(X[:, :-1])
+        loss = sum([loss_fn(pred[:, :, i], X[:, lag:, i]) for i in range(p)])
+
+        # Take gradient step.
+        loss.backward()
+        optimizer.step()
+        cmlp.zero_grad()
+
+        # Check progress.
+        if (it + 1) % check_every == 0:
+            mean_loss = loss / p
+            train_loss_list.append(mean_loss.detach())
+
+            if verbose > 0:
+                print(('-' * 10 + 'Iter = %d' + '-' * 10) % (it + 1))
+                print('Loss = %f' % mean_loss)
+
+            # Check for early stopping.
+            if mean_loss < best_loss:
+                best_loss = mean_loss
+                best_it = it
+                best_model = deepcopy(cmlp)
+            elif (it - best_it) == lookback * check_every:
+                if verbose:
+                    print('Stopping early')
+                break
+
+    # Restore best model.
+    restore_parameters(cmlp, best_model)
 
     return train_loss_list
